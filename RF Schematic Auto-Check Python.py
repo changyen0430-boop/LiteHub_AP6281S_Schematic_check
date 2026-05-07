@@ -2,18 +2,31 @@ import streamlit as st
 from google import genai
 import json
 import re
+# --- 1. 初始化 (務必先取得 Key，再建立 Client) ---
 
-# --- 1. 初始化 (從 Streamlit Secrets 讀取，安全捕捉報錯) ---
+# A. 先取得變數 (從 Secrets 或側邊欄)
 try:
-    # 嘗試從 Secrets 讀取
     GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY")
 except Exception:
-    # 如果完全找不到 secrets.toml 或是讀取失敗，將變數設為 None
     GEMINI_API_KEY = None
 
 if not GEMINI_API_KEY:
-    # 在本地端或未設定 Secret 的情況下，顯示側邊欄輸入框
     GEMINI_API_KEY = st.sidebar.text_input("請輸入新產生的 Gemini API Key", type="password")
+
+# B. 取得 Key 之後，才建立 Client
+if GEMINI_API_KEY:
+    try:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        
+        # 測試：列出可用模型 (僅在開發測試時執行一次即可)
+        # models = client.models.list()
+        # for m in models:
+        #     print(f"可用模型名稱: {m.name}")
+            
+    except Exception as e:
+        st.error(f"Client 初始化失敗: {e}")
+else:
+    st.warning("🔑 請先提供 API Key 以繼續執行。")
 
 st.set_page_config(page_title="RF Schematic Auditor", layout="wide")
 st.title("📡 RF 線路檢查系統")
@@ -102,111 +115,226 @@ with p_col3:
 
 # --- 4. 執行分析 ---
 st.divider()
-f_ref = st.file_uploader("1. 上傳公版 PDF", type="pdf")
-f_imp = st.file_uploader("2. 上傳實作 PDF", type="pdf")
+f_ref = st.file_uploader("1. 上傳公版 PDF", type="pdf", key="ref_up")
+f_imp = st.file_uploader("2. 上傳實作 PDF", type="pdf", key="imp_up")
 
-if st.button("🚀 啟動全方位稽核"):
-    if GEMINI_API_KEY and f_ref and f_imp:
-        with st.spinner("正在進行視覺強化掃描..."):
-            try:
-                client = genai.Client(api_key=GEMINI_API_KEY)
-                
-                PROMPT = f"""
-                你是專業硬體稽核專家。請分析實作圖紙 (Foxconn Implementation) 並嚴格執行：
+# 診斷按鈕 (永遠顯示，只要有 API Key)
+if st.button("🔍 檢查可用模型清單", key="diag"):
+    if GEMINI_API_KEY:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        st.write("### 您的 Key 可用模型清單：")
+        try:
+            for m in client.models.list():
+                st.code(m.name)
+        except Exception as e:
+            st.error(f"無法取得列表: {e}")
+    else:
+        st.warning("請先輸入 API Key")
 
-                1. RF 路徑精準辨識：
-                   - 定位到 Pin 2 (WL/BT_ANT0) 往外延伸的走線。
-                   - 找到元件 C628, C627, C626。
-                   - **核心動作**：請檢查每個元件符號的正下方是否有 'NI'。
-                   - 若有 'NI'，act 欄位必須回傳 "NI"。不要只回傳 10pF。
+# 核心邏輯：處理檔案並顯示三階段按鈕
+if f_ref and f_imp:
+    # 使用 session_state 防止讀取後按鈕消失
+    if 'ref_content' not in st.session_state or st.sidebar.button("🔄 刷新上傳檔案"):
+        st.session_state['ref_content'] = f_ref.read()
+        st.session_state['imp_content'] = f_imp.read()
 
-                2. 電源區塊排除干擾：
-                   - Pin 9 (VBAT): 必須找 C 開頭的元件值 (如 4.7uF)。如果讀到 3.3V，那是電壓，請跳過。提取兩顆電容分別放入 vbat_cap1, vbat_cap2。
-                   - VDDIO 電壓標籤 請Scan Foxconn 圖紙 找到VBAT3.3V or VBAT:3.3V 相關字眼
-                   - Pin 22 (VDDIO): 必須找 VDDIO 或 PWR_1V8 等標籤。
-                   - Pin 21 (ASR_VLX): 找到L49跟C630。分別提取感值跟容值分別放入 pin21_l1, pin21_c14。
-                回傳純 JSON：
-                {{
-                  "clock_system": {{ "freq", "cap1", "cap2", "rtc" }},
-                  "rf_path": [ {{ "des": "C628", "act": "NI" }}, {{ "des": "C627", "act": "10pF" }}, {{ "des": "C626", "act": "NI" }} ],
-                  "power_config": {{ "vbat_net", "vbat_cap1", "vbat_cap2", "vddio_net", "vddio_cap1", "vddio_cap2", "pin21_l1", "pin21_c14" }}
-                }}
-                """
-                
-                response = client.models.generate_content(
-                    model="gemini-3-flash-preview",
-                    contents=[
-                        genai.types.Part.from_bytes(data=f_ref.read(), mime_type="application/pdf"),
-                        PROMPT,
-                        genai.types.Part.from_bytes(data=f_imp.read(), mime_type="application/pdf")
-                    ]
-                )
-                
-                data = json.loads(re.search(r'\{.*\}', response.text, re.DOTALL).group())
-                st.success("稽核完成！")
-                
-                t1, t2, t3 = st.tabs(["時鐘比對", "RF 路徑 (Foxconn)", "電源規範"])
-                
-                with t1:
-                    clk = data.get('clock_system', {})
-                    for label, act, std in [("主頻率", clk.get('freq'), std_xtal), ("負載電容 1", clk.get('cap1'), std_cap1), ("負載電容 2", clk.get('cap2'), std_cap2), ("RTC 頻率", clk.get('rtc'), std_rtc)]:
-                        msg, _ = judge_logic(act, std)
-                        st.write(f"🔹 **{label}**: `{act}` (標準: {std}) -> **{msg}**")
+    pdf_ref_bytes = st.session_state['ref_content']
+    pdf_imp_bytes = st.session_state['imp_content']
+    
+    # 你剛才清單中最強的模型
+    TARGET_MODEL = "gemini-3-flash-preview"
+    
+    st.info(f"💡 目前使用模型: `{TARGET_MODEL}`。請根據需求點擊下方按鈕進行稽核。")
+    
+    col1, col2, col3 = st.columns(3)
 
-                with t2:
-                    st.subheader("⚡ Pin 2 (Foxconn 實作) 路徑稽核")
-                    rf_res = []
-                    path_data = data.get("rf_path", [])
-                    for i in range(3):
-                        item = path_data[i] if i < len(path_data) else {}
-                        ui_std = rf_configs[i]['std_val']
-                        res, _ = judge_logic(item.get('act'), ui_std)
-                        rf_res.append({
-                            "元件位號": item.get('des', '未抓到'),
-                            "讀取值 (Actual)": item.get('act', 'N/A'),
-                            "標準值 (Standard)": ui_std,
-                            "結果判定": res
-                        })
-                    st.table(rf_res)
+    # --- 階段 1：時鐘按鈕 ---
+# --- 階段 1：時鐘按鈕 (鎖定 Page 15) ---
+    with col1:
+        if st.button("🕒 1. 稽核時鐘系統", use_container_width=True, key="btn_clk"):
+            with st.spinner("正在掃描 Foxconn 圖紙 Page 15..."):
+                try:
+                    client = genai.Client(api_key=GEMINI_API_KEY)
+                    
+                    # 修正 P1：加入 Page 15 鎖定指令
+                    P1 = """
+                    你是時鐘稽核專家。
+                    任務：請針對實作圖紙 (Foxconn) 的『第 15 頁 (Page 15)』進行掃描。
+                    1. 找到主晶振並提取其頻率 (Frequency)。
+                    2. 提取與該晶振相連的負載電容 cap1, cap2。
+                    3. 找到 RTC 區塊並提取其頻率。
+                    
+                    回傳 JSON: { 'clock_system': { 'freq', 'cap1', 'cap2', 'rtc' } }
+                    """
+                    
+                    res = client.models.generate_content(
+                        model=TARGET_MODEL,
+                        contents=[
+                            genai.types.Part.from_bytes(data=pdf_ref_bytes, mime_type="application/pdf"),
+                            P1,
+                            genai.types.Part.from_bytes(data=pdf_imp_bytes, mime_type="application/pdf")
+                        ]
+                    )
+                    
+                    # 取得 JSON 部分
+                    json_match = re.search(r'\{.*\}', res.text, re.DOTALL)
+                    if json_match:
+                        st.session_state['data_clk'] = json.loads(json_match.group())
+                        st.success("✅ 時鐘分析完成 (已定位 Page 15)")
+                    else:
+                        st.error("未能從 AI 回覆中提取有效的 JSON 數據")
+                        
+                except Exception as e:
+                    st.error(f"時鐘分析失敗: {e}")
 
-                with t3:
-                    p = data.get("power_config", {})
+# --- 階段 2：RF 按鈕 (視覺狙擊版) ---
+    with col2:
+        if st.button("⚡ 2. 稽核 RF 路徑", use_container_width=True, key="btn_rf"):
+            with st.spinner("偵測到特殊 NI 標註，啟動深度視覺掃描..."):
+                try:
+                    client = genai.Client(api_key=GEMINI_API_KEY)
+                    P2 = """
+                    你是專業硬體稽核專家，現在檢查 Foxconn 圖紙 Page 15。
                     
-                    # 交叉檢查電容函式
-                    def check_caps(a1, a2, s1, s2):
-                        r1, b1 = judge_logic(a1, s1); r2, b2 = judge_logic(a2, s2)
-                        if b1 and b2: return r1, r2
-                        r1a, b1a = judge_logic(a1, s2); r2a, b2a = judge_logic(a2, s1)
-                        if b1a and b2a: return "✅ PASS (順序調整)", "✅ PASS (順序調整)"
-                        return r1, r2
+                    任務：稽核 C626, C627, C626 狀態。
+                    ⚠️ 核心視覺掃描指令：
+                    1. 先定位 C626, C627, C628 的元件位置。
+                    2. 檢查每個元件『兩條平行橫線 (電容符號)』的的正下方或正中間。
+                    3. ⚠️ 視覺警告：在 C626 和 C628 的電容圖示正下方，有非常小的『NI』字樣，請務必識別出來。
+                    
+                    判定規則：
+                    - 如果電容符號下方或旁邊有任何『NI』或『NC』字樣：'act' 欄位請填寫 'NI'。
+                    - 如果符號乾淨且只有數值：則填寫讀到的數值 (例如 '10pF')。
+                    
+                    回傳 JSON: { 'rf_path': [ {'des': 'C628', 'act': '...'}, {'des': 'C627', 'act': '...'}, {'des': 'C626', 'act': '...'} ] }
+                    """
+                    res = client.models.generate_content(
+                        model=TARGET_MODEL,
+                        contents=[
+                            genai.types.Part.from_bytes(data=pdf_ref_bytes, mime_type="application/pdf"),
+                            P2,
+                            genai.types.Part.from_bytes(data=pdf_imp_bytes, mime_type="application/pdf")
+                        ]
+                    )
+                    st.session_state['data_rf'] = json.loads(re.search(r'\{.*\}', res.text, re.DOTALL).group())
+                    st.success("✅ RF 視覺掃描完成 (已針對隱藏式 NI 優化)")
+                except Exception as e:
+                    st.error(f"分析失敗: {e}")
 
-                    # VBAT 判定
-                    v_net = p.get('vbat_net')
-                    st.write(f"⚡ **VBAT 標籤**: `{v_net}` (標準: {std_vbat_v}) -> **{judge_logic(v_net, std_vbat_v)[0]}**")
-                    
-                    # 拆分 VBAT UI 標準值 (4.7uF, 1uF)
-                    v_std_list = [x.strip() for x in std_vbat_c.split(',')]
-                    v_s1 = v_std_list[0] if len(v_std_list) > 0 else ""
-                    v_s2 = v_std_list[1] if len(v_std_list) > 1 else ""
-                    
-                    # 使用交叉檢查比對 VBAT 的兩顆電容
-                    v1r, v2r = check_caps(p.get('vbat_cap1'), p.get('vbat_cap2'), v_s1, v_s2)
-                    st.write(f"🔸 **VBAT 電容 1**: `{p.get('vbat_cap1')}` -> **{v1r}**")
-                    st.write(f"🔸 **VBAT 電容 2**: `{p.get('vbat_cap2')}` -> **{v2r}**")
-                    
-                    st.divider()
-                    
-                    # VDDIO 判定
-                    v_net_io = p.get('vddio_net')
-                    st.write(f"⚡ **VDDIO 標籤**: `{v_net_io}` (標準: {std_vddio_v}) -> **{judge_logic(v_net_io, std_vddio_v)[0]}**")
-                    
-                    c1r, c2r = check_caps(p.get('vddio_cap1'), p.get('vddio_cap2'), std_vddio_c1, std_vddio_c2)
-                    st.write(f"🔸 **VDDIO 電容 1**: `{p.get('vddio_cap1')}` -> **{c1r}**")
-                    st.write(f"🔸 **VDDIO 電容 2**: `{p.get('vddio_cap2')}` -> **{c2r}**")
-                    
-                    st.divider()
-                    st.write(f"🔹 **L1 電感**: `{p.get('pin21_l1')}` -> **{judge_logic(p.get('pin21_l1'), std_pin21_l)[0]}**")
-                    st.write(f"🔹 **C14 電容**: `{p.get('pin21_c14')}` -> **{judge_logic(p.get('pin21_c14'), std_pin21_c)[0]}**")
+# --- 階段 3：電源按鈕 (座標綁定版) ---
+    with col3:
+        if st.button("🔋 3. 稽核電源規範", use_container_width=True, key="btn_pwr"):
+            with st.spinner("正在執行 Pin-to-Cap 視覺追蹤 (Page 15)..."):
+                try:
+                    client = genai.Client(api_key=GEMINI_API_KEY)
+                    P3 = """
+                    你是專業電源硬體專家。任務：檢查實作圖紙 (Foxconn) Page 15。
+                    ⚠️ 嚴格執行路徑追蹤：
+                    1. 定位 Pin 9 (VBAT): 沿著線路尋找最靠近該引腳的兩顆旁路電容。確認位號與數值。
+                    2. 定位 Pin 22 (VDDIO): 沿著線路尋找最靠近該引腳的兩顆旁路電容。務必區分清楚，不要跟 Pin 9 的混淆。
+                    3. 定位 Pin 21 (ASR_VLX): 提取電感 L49 與電容 C630。
 
-            except Exception as e:
-                st.error(f"分析失敗: {e}")
+                    回傳 JSON 格式 (請確保位號正確):
+                    { 
+                      'power_config': { 
+                        'vbat_net': '...', 
+                        'vbat_cap1': '位號(數值)', 
+                        'vbat_cap2': '位號(數值)', 
+                        'vddio_net': '...', 
+                        'vddio_cap1': '位號(數值)', 
+                        'vddio_cap2': '位號(數值)', 
+                        'pin21_l1': '...', 
+                        'pin21_c14': '...' 
+                      } 
+                    }
+                    """
+                    res = client.models.generate_content(
+                        model=TARGET_MODEL,
+                        contents=[
+                            genai.types.Part.from_bytes(data=pdf_ref_bytes, mime_type="application/pdf"),
+                            P3,
+                            genai.types.Part.from_bytes(data=pdf_imp_bytes, mime_type="application/pdf")
+                        ]
+                    )
+                    st.session_state['data_pwr'] = json.loads(re.search(r'\{.*\}', res.text, re.DOTALL).group())
+                    st.success("✅ 電源分析完成 (已強化腳位追蹤)")
+                except Exception as e:
+                    st.error(f"分析失敗: {e}")
+
+# --- 5. 結果顯示區 ---
+if any(key in st.session_state for key in ['data_clk', 'data_rf', 'data_pwr']):
+    st.divider()
+    t1, t2, t3 = st.tabs(["時鐘比對", "RF 路徑 (Foxconn)", "電源規範"])
+
+    with t1:
+        if 'data_clk' in st.session_state:
+            data_source = st.session_state['data_clk']
+            clk = data_source.get('clock_system', {})
+            for label, act, std in [
+                ("主頻率", clk.get('freq'), std_xtal), 
+                ("負載電容 1", clk.get('cap1'), std_cap1), 
+                ("負載電容 2", clk.get('cap2'), std_cap2), 
+                ("RTC 頻率", clk.get('rtc'), std_rtc)
+            ]:
+                msg, _ = judge_logic(act, std)
+                st.write(f"🔹 **{label}**: `{act}` (標準: {std}) -> **{msg}**")
+        else:
+            st.info("請點擊上方按鈕 1 開始分析時鐘")
+
+    with t2:
+        if 'data_rf' in st.session_state:
+            data_source = st.session_state['data_rf']
+            st.subheader("⚡ Pin 2 (Foxconn 實作) 路徑稽核")
+            rf_res = []
+            path_data = data_source.get("rf_path", [])
+            for i in range(3):
+                item = path_data[i] if i < len(path_data) else {}
+                ui_std = rf_configs[i]['std_val']
+                res, _ = judge_logic(item.get('act'), ui_std)
+                rf_res.append({
+                    "元件位號": item.get('des', '未抓到'),
+                    "讀取值 (Actual)": item.get('act', 'N/A'),
+                    "標準值 (Standard)": ui_std,
+                    "結果判定": res
+                })
+            st.table(rf_res)
+        else:
+            st.info("請點擊上方按鈕 2 開始分析 RF 路徑")
+
+    with t3:
+        if 'data_pwr' in st.session_state:
+            data_source = st.session_state['data_pwr']
+            p = data_source.get("power_config", {})
+            
+            def check_caps(a1, a2, s1, s2):
+                r1, b1 = judge_logic(a1, s1); r2, b2 = judge_logic(a2, s2)
+                if b1 and b2: return r1, r2
+                r1a, b1a = judge_logic(a1, s2); r2a, b2a = judge_logic(a2, s1)
+                if b1a and b2a: return "✅ PASS (順序調整)", "✅ PASS (順序調整)"
+                return r1, r2
+
+            v_net = p.get('vbat_net')
+            st.write(f"⚡ **VBAT 標籤**: `{v_net}` (標準: {std_vbat_v}) -> **{judge_logic(v_net, std_vbat_v)[0]}**")
+            
+            v_std_list = [x.strip() for x in std_vbat_c.split(',')]
+            v_s1 = v_std_list[0] if len(v_std_list) > 0 else ""
+            v_s2 = v_std_list[1] if len(v_std_list) > 1 else ""
+            
+            v1r, v2r = check_caps(p.get('vbat_cap1'), p.get('vbat_cap2'), v_s1, v_s2)
+            st.write(f"🔸 **VBAT 電容 1**: `{p.get('vbat_cap1')}` -> **{v1r}**")
+            st.write(f"🔸 **VBAT 電容 2**: `{p.get('vbat_cap2')}` -> **{v2r}**")
+            
+            st.divider()
+            
+            v_net_io = p.get('vddio_net')
+            st.write(f"⚡ **VDDIO 標籤**: `{v_net_io}` (標準: {std_vddio_v}) -> **{judge_logic(v_net_io, std_vddio_v)[0]}**")
+            
+            c1r, c2r = check_caps(p.get('vddio_cap1'), p.get('vddio_cap2'), std_vddio_c1, std_vddio_c2)
+            st.write(f"🔸 **VDDIO 電容 1**: `{p.get('vddio_cap1')}` -> **{c1r}**")
+            st.write(f"🔸 **VDDIO 電容 2**: `{p.get('vddio_cap2')}` -> **{c2r}**")
+            
+            st.divider()
+            st.write(f"🔹 **L49 電感**: `{p.get('pin21_l1')}` -> **{judge_logic(p.get('pin21_l1'), std_pin21_l)[0]}**")
+            st.write(f"🔹 **C630 電容**: `{p.get('pin21_c14')}` -> **{judge_logic(p.get('pin21_c14'), std_pin21_c)[0]}**")
+        else:
+            st.info("請點擊上方按鈕 3 開始分析電源系統")
