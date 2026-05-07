@@ -3,14 +3,17 @@ from google import genai
 import json
 import re
 
-# --- 1. 初始化 (從 Streamlit Secrets 讀取，不要寫死) ---
-# 在 Streamlit Cloud 部署頁面點擊 "Settings" -> "Secrets"
-# 輸入內容：GEMINI_API_KEY = "你的新API_KEY"
-if "GEMINI_API_KEY" in st.secrets:
-    GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
-else:
-    # 本地測試時若沒設定 Secrets，則嘗試手動輸入框或保持空白
-    GEMINI_API_KEY = st.sidebar.text_input("請輸入 Gemini API Key", type="password")
+# --- 1. 初始化 (從 Streamlit Secrets 讀取，安全捕捉報錯) ---
+try:
+    # 嘗試從 Secrets 讀取
+    GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY")
+except Exception:
+    # 如果完全找不到 secrets.toml 或是讀取失敗，將變數設為 None
+    GEMINI_API_KEY = None
+
+if not GEMINI_API_KEY:
+    # 在本地端或未設定 Secret 的情況下，顯示側邊欄輸入框
+    GEMINI_API_KEY = st.sidebar.text_input("請輸入新產生的 Gemini API Key", type="password")
 
 st.set_page_config(page_title="RF Schematic Auditor", layout="wide")
 st.title("📡 RF 線路檢查系統")
@@ -121,7 +124,7 @@ if st.button("🚀 啟動全方位稽核"):
                    - Pin 9 (VBAT): 必須找 C 開頭的元件值 (如 4.7uF)。如果讀到 3.3V，那是電壓，請跳過。提取兩顆電容分別放入 vbat_cap1, vbat_cap2。
                    - VDDIO 電壓標籤 請Scan Foxconn 圖紙 找到VBAT3.3V or VBAT:3.3V 相關字眼
                    - Pin 22 (VDDIO): 必須找 VDDIO 或 PWR_1V8 等標籤。
-
+                   - Pin 21 (ASR_VLX): 找到L49跟C630。分別提取感值跟容值分別放入 pin21_l1, pin21_c14。
                 回傳純 JSON：
                 {{
                   "clock_system": {{ "freq", "cap1", "cap2", "rtc" }},
