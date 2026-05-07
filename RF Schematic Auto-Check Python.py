@@ -3,8 +3,14 @@ from google import genai
 import json
 import re
 
-# --- 1. 初始化 ---
-GEMINI_API_KEY = "AIzaSyCkEzENOkz_o-FXNvlo1oiQPdzp7CxoITc" 
+# --- 1. 初始化 (從 Streamlit Secrets 讀取，不要寫死) ---
+# 在 Streamlit Cloud 部署頁面點擊 "Settings" -> "Secrets"
+# 輸入內容：GEMINI_API_KEY = "你的新API_KEY"
+if "GEMINI_API_KEY" in st.secrets:
+    GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
+else:
+    # 本地測試時若沒設定 Secrets，則嘗試手動輸入框或保持空白
+    GEMINI_API_KEY = st.sidebar.text_input("請輸入 Gemini API Key", type="password")
 
 st.set_page_config(page_title="RF Schematic Auditor", layout="wide")
 st.title("📡 RF 線路檢查系統")
